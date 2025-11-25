@@ -1,7 +1,34 @@
+// 自定义优质IP数量
+const FAST_IP_COUNT = 25; // 修改这个数字来自定义优质IP数量
+
 export default {
     async scheduled(event, env, ctx) {
       console.log('Running scheduled IP update...');
-      await updateAllIPs(env);
+
+      try {
+        if (!env.IP_STORAGE) {
+          console.error('KV namespace IP_STORAGE is not bound');
+          return;
+        }
+
+        const startTime = Date.now();
+        const { uniqueIPs, results } = await updateAllIPs(env);
+        const duration = Date.now() - startTime;
+
+        await env.IP_STORAGE.put('cloudflare_ips', JSON.stringify({
+          ips: uniqueIPs,
+          lastUpdated: new Date().toISOString(),
+          count: uniqueIPs.length,
+          sources: results
+        }));
+
+        // 自动触发测速并存储优质IP
+        await autoSpeedTestAndStore(env, uniqueIPs);
+
+        console.log(`Scheduled update: ${uniqueIPs.length} IPs collected in ${duration}ms`);
+      } catch (error) {
+        console.error('Scheduled update failed:', error);
+      }
     },
   
     async fetch(request, env, ctx) {
@@ -39,6 +66,10 @@ export default {
             return await handleSpeedTest(request, env);
           case '/itdog-data':
             return await handleItdogData(env);
+          case '/fast-ips':
+            return await handleGetFastIPs(env);
+          case '/fast-ips.txt':
+            return await handleGetFastIPsText(env);
           default:
             return jsonResponse({ error: 'Endpoint not found' }, 404);
         }
@@ -53,12 +84,16 @@ export default {
   async function serveHTML(env) {
     const data = await getStoredIPs(env);
     
+    // 获取测速后的IP数据
+    const speedData = await getStoredSpeedIPs(env);
+    const fastIPs = speedData.fastIPs || [];
+    
     const html = `<!DOCTYPE html>
   <html lang="zh-CN">
   <head>
       <meta charset="UTF-8">
       <meta name="viewport" content="width=device-width, initial-scale=1.0">
-      <title>Cloudflare 优选IP 收集器</title>
+      <title>Cloudflare IP 收集器</title>
       <style>
           * { 
               margin: 0; 
@@ -268,6 +303,55 @@ export default {
               background: #f8fafc;
               border-color: #94a3b8;
               box-shadow: 0 4px 8px rgba(0, 0, 0, 0.1);
+          }
+          
+          /* 下拉按钮组 */
+          .dropdown {
+              position: relative;
+              display: inline-block;
+          }
+          
+          .dropdown-content {
+              display: none;
+              position: absolute;
+              background-color: white;
+              min-width: 160px;
+              box-shadow: 0 8px 16px 0 rgba(0,0,0,0.1);
+              z-index: 1;
+              border-radius: 10px;
+              border: 1px solid #e2e8f0;
+              overflow: hidden;
+              top: 100%;
+              left: 0;
+              margin-top: 5px;
+          }
+          
+          .dropdown-content a {
+              color: #475569;
+              padding: 12px 16px;
+              text-decoration: none;
+              display: block;
+              border-bottom: 1px solid #f1f5f9;
+              transition: all 0.3s ease;
+          }
+          
+          .dropdown-content a:hover {
+              background-color: #f8fafc;
+              color: #1e40af;
+          }
+          
+          .dropdown-content a:last-child {
+              border-bottom: none;
+          }
+          
+          .dropdown:hover .dropdown-content {
+              display: block;
+          }
+          
+          .dropdown-btn {
+              display: flex;
+              align-items: center;
+              gap: 4px;
           }
           
           /* IP 列表 */
@@ -513,6 +597,18 @@ export default {
                   justify-content: center;
               }
               
+              .dropdown {
+                  width: 100%;
+              }
+              
+              .dropdown-content {
+                  width: 100%;
+                  position: static;
+                  box-shadow: none;
+                  border: 1px solid #e2e8f0;
+                  margin-top: 8px;
+              }
+              
               .ip-list-header {
                   flex-direction: column;
                   align-items: flex-start;
@@ -545,8 +641,8 @@ export default {
           <!-- 头部区域 -->
           <div class="header">
               <div class="header-content">
-                  <h1>🌐 Cloudflare 优选IP 收集器</h1>
-                  <p>网络加速专家 | 智能测速与优化</p>
+                  <h1>Cloudflare 优选IP 收集器</h1>
+                  <p> 自动定时拉取IP并测速</p>
               </div>
               <div class="social-links">
                   <a href="https://youtu.be/rZl2jz--Oes" target="_blank" title="好软推荐" class="social-link youtube">
@@ -583,18 +679,39 @@ export default {
                       <div class="stat-value" id="last-time">${data.lastUpdated ? new Date(data.lastUpdated).toLocaleTimeString() : '从未更新'}</div>
                       <div>更新时间</div>
                   </div>
+                  <div class="stat">
+                      <div class="stat-value" id="fast-ip-count">${fastIPs.length}</div>
+                      <div>优质 IP 数量</div>
+                  </div>
               </div>
               
               <div class="button-group">
                   <button class="button" onclick="updateIPs()" id="update-btn">
                       🔄 立即更新
                   </button>
-                  <a href="/ips" class="button button-success" download="cloudflare_ips.txt">
-                      📥 下载列表
-                  </a>
-                  <a href="/ip.txt" class="button button-secondary" target="_blank">
-                      🔗 查看文本
-                  </a>
+                  
+                  <!-- 下载按钮组 -->
+                  <div class="dropdown">
+                      <a href="/fast-ips.txt" class="button button-success dropdown-btn" download="cloudflare_fast_ips.txt">
+                          ⚡ 下载优质IP
+                          <span style="font-size: 0.8rem;">▼</span>
+                      </a>
+                      <div class="dropdown-content">
+                          <a href="/ips" download="cloudflare_ips.txt">📥 下载全部列表</a>
+                      </div>
+                  </div>
+                  
+                  <!-- 查看按钮组 -->
+                  <div class="dropdown">
+                      <a href="/fast-ips.txt" class="button button-secondary dropdown-btn" target="_blank">
+                          🔗 查看优质IP
+                          <span style="font-size: 0.8rem;">▼</span>
+                      </a>
+                      <div class="dropdown-content">
+                          <a href="/ip.txt" target="_blank">📋 查看全部文本</a>
+                      </div>
+                  </div>
+                  
                   <button class="button button-warning" onclick="startSpeedTest()" id="speedtest-btn">
                       ⚡ 开始测速
                   </button>
@@ -614,16 +731,13 @@ export default {
               <div class="result" id="result"></div>
           </div>
 
-          <!-- IP 列表卡片 -->
+          <!-- 优质IP列表卡片 -->
           <div class="card">
               <div class="ip-list-header">
-                  <h2>📋 IP 地址列表</h2>
+                  <h2>⚡ 优质 IP 列表</h2>
                   <div>
-                      <button class="small-btn" onclick="copyAllIPs()">
-                          📋 复制全部
-                      </button>
-                      <button class="small-btn" onclick="sortBySpeed()" id="sort-btn">
-                          🔽 按速度排序
+                      <button class="small-btn" onclick="copyAllFastIPs()">
+                          📋 复制优质IP
                       </button>
                   </div>
               </div>
@@ -634,19 +748,23 @@ export default {
               <div style="text-align: center; margin: 8px 0; font-size: 0.9rem; color: #64748b;" id="speed-test-status">准备测速...</div>
               
               <div class="ip-list" id="ip-list">
-                  ${data.ips && data.ips.length > 0 ? 
-                    data.ips.map(ip => `
+                  ${fastIPs.length > 0 ? 
+                    fastIPs.map(item => {
+                      const ip = item.ip;
+                      const latency = item.latency;
+                      const speedClass = latency < 200 ? 'speed-fast' : latency < 500 ? 'speed-medium' : 'speed-slow';
+                      return `
                       <div class="ip-item" data-ip="${ip}">
                           <div class="ip-info">
                               <span class="ip-address">${ip}</span>
-                              <span class="speed-result" id="speed-${ip.replace(/\./g, '-')}">-</span>
+                              <span class="speed-result ${speedClass}" id="speed-${ip.replace(/\./g, '-')}">${latency}ms</span>
                           </div>
                           <div class="action-buttons">
                               <button class="small-btn" onclick="copyIP('${ip}')">复制</button>
                           </div>
                       </div>
-                    `).join('') : 
-                    '<p style="text-align: center; color: #64748b; padding: 40px;">暂无 IP 地址数据，请点击更新按钮获取</p>'
+                    `}).join('') : 
+                    '<p style="text-align: center; color: #64748b; padding: 40px;">暂无优质 IP 地址数据，请点击更新按钮获取</p>'
                   }
               </div>
           </div>
@@ -669,7 +787,7 @@ export default {
 
           <!-- 页脚 -->
           <div class="footer">
-              <p>Cloudflare 优选IP Collector &copy; ${new Date().getFullYear()} | 好软推荐</p>
+              <p>Cloudflare IP Collector &copy; ${new Date().getFullYear()} | 好软推荐</p>
           </div>
       </div>
 
@@ -756,6 +874,22 @@ export default {
               
               navigator.clipboard.writeText(allIPs).then(() => {
                   showMessage(\`已复制 \${ipItems.length} 个IP地址\`);
+              }).catch(err => {
+                  showMessage('复制失败，请手动复制', 'error');
+              });
+          }
+
+          function copyAllFastIPs() {
+              const ipItems = document.querySelectorAll('.ip-item span.ip-address');
+              const allIPs = Array.from(ipItems).map(span => span.textContent).join('\\n');
+              
+              if (!allIPs) {
+                  showMessage('没有可复制的优质IP地址', 'error');
+                  return;
+              }
+              
+              navigator.clipboard.writeText(allIPs).then(() => {
+                  showMessage(\`已复制 \${ipItems.length} 个优质IP地址\`);
               }).catch(err => {
                   showMessage('复制失败，请手动复制', 'error');
               });
@@ -848,34 +982,10 @@ export default {
               speedtestBtn.textContent = '⚡ 开始测速';
               progressBar.style.display = 'none';
               
-              sortBySpeed();
+              showMessage(\`测速完成，已测试 \${currentTestIndex} 个IP地址\`);
               
-              showMessage(\`测速完成，已测试 \${currentTestIndex} 个IP地址，已按延迟排序\`);
-          }
-
-          function sortBySpeed() {
-              const ipList = document.getElementById('ip-list');
-              const ipItems = Array.from(ipList.querySelectorAll('.ip-item'));
-              
-              ipItems.sort((a, b) => {
-                  const ipA = a.dataset.ip;
-                  const ipB = b.dataset.ip;
-                  
-                  const resultA = speedResults[ipA];
-                  const resultB = speedResults[ipB];
-                  
-                  if (resultA && resultB) {
-                      return resultA.latency - resultB.latency;
-                  } else if (resultA && !resultB) {
-                      return -1;
-                  } else if (!resultA && resultB) {
-                      return 1;
-                  } else {
-                      return 0;
-                  }
-              });
-              
-              ipItems.forEach(item => ipList.appendChild(item));
+              // 测速完成后刷新数据，显示最新的优质IP列表
+              setTimeout(refreshData, 1000);
           }
 
           async function updateIPs() {
@@ -933,31 +1043,32 @@ export default {
                   document.getElementById('last-time').textContent = data.lastUpdated ? 
                       new Date(data.lastUpdated).toLocaleTimeString() : '从未更新';
                   
+                  // 获取优质IP数据
+                  const fastResponse = await fetch('/fast-ips');
+                  const fastData = await fastResponse.json();
+                  
+                  document.getElementById('fast-ip-count').textContent = fastData.fastIPs ? fastData.fastIPs.length : 0;
+                  
                   const ipList = document.getElementById('ip-list');
-                  if (data.ips && data.ips.length > 0) {
-                      ipList.innerHTML = data.ips.map(ip => \`
+                  if (fastData.fastIPs && fastData.fastIPs.length > 0) {
+                      ipList.innerHTML = fastData.fastIPs.map(item => {
+                          const ip = item.ip;
+                          const latency = item.latency;
+                          const speedClass = latency < 200 ? 'speed-fast' : latency < 500 ? 'speed-medium' : 'speed-slow';
+                          return \`
                           <div class="ip-item" data-ip="\${ip}">
                               <div class="ip-info">
                                   <span class="ip-address">\${ip}</span>
-                                  <span class="speed-result" id="speed-\${ip.replace(/\./g, '-')}">\${speedResults[ip] ? Math.round(speedResults[ip].latency) + 'ms' : '-'}</span>
+                                  <span class="speed-result \${speedClass}" id="speed-\${ip.replace(/\./g, '-')}">\${latency}ms</span>
                               </div>
                               <div class="action-buttons">
                                   <button class="small-btn" onclick="copyIP('\${ip}')">复制</button>
                               </div>
                           </div>
-                      \`).join('');
-                      
-                      Object.keys(speedResults).forEach(ip => {
-                          const result = speedResults[ip];
-                          const speedElement = document.getElementById(\`speed-\${ip.replace(/\./g, '-')}\`);
-                          if (speedElement && result) {
-                              const speedClass = result.latency < 200 ? 'speed-fast' : result.latency < 500 ? 'speed-medium' : 'speed-slow';
-                              speedElement.textContent = \`\${Math.round(result.latency)}ms\`;
-                              speedElement.className = \`speed-result \${speedClass}\`;
-                          }
-                      });
+                          \`;
+                      }).join('');
                   } else {
-                      ipList.innerHTML = '<p style="text-align: center; color: #64748b; padding: 40px;">暂无 IP 地址数据，请点击更新按钮获取</p>';
+                      ipList.innerHTML = '<p style="text-align: center; color: #64748b; padding: 40px;">暂无优质 IP 地址数据，请点击更新按钮获取</p>';
                   }
                   
                   const sources = document.getElementById('sources');
@@ -991,7 +1102,29 @@ export default {
     });
   }
   
-  // 其他函数保持不变...
+  // 处理优质IP列表获取（JSON格式）
+  async function handleGetFastIPs(env) {
+    const data = await getStoredSpeedIPs(env);
+    return jsonResponse(data);
+  }
+  
+  // 处理优质IP列表获取（文本格式，IP#实际的延迟ms格式）
+  async function handleGetFastIPsText(env) {
+    const data = await getStoredSpeedIPs(env);
+    const fastIPs = data.fastIPs || [];
+    
+    // 格式化为 IP#实际的延迟ms
+    const ipList = fastIPs.map(item => `${item.ip}#${item.latency}ms`).join('\n');
+    
+    return new Response(ipList, {
+      headers: {
+        'Content-Type': 'text/plain; charset=utf-8',
+        'Content-Disposition': 'inline; filename="cloudflare_fast_ips.txt"',
+        'Access-Control-Allow-Origin': '*'
+      }
+    });
+  }
+  
   // 处理 ITDog 数据获取
   async function handleItdogData(env) {
     const data = await getStoredIPs(env);
@@ -1069,9 +1202,12 @@ export default {
         sources: results
       }));
 
+      // 自动触发测速并存储优质IP
+      await autoSpeedTestAndStore(env, uniqueIPs);
+
       return jsonResponse({
         success: true,
-        message: 'IPs collected successfully',
+        message: 'IPs collected and speed test completed successfully',
         duration: `${duration}ms`,
         totalIPs: uniqueIPs.length,
         timestamp: new Date().toISOString(),
@@ -1083,6 +1219,97 @@ export default {
         success: false,
         error: error.message
       }, 500);
+    }
+  }
+  
+  // 自动测速并存储优质IP
+  async function autoSpeedTestAndStore(env, ips) {
+    if (!ips || ips.length === 0) return;
+    
+    const speedResults = [];
+    const BATCH_SIZE = 5; // 控制并发数
+    
+    // 只测速前100个IP以提高效率
+    const ipsToTest = ips.slice(0, 100);
+    
+    console.log(`Starting auto speed test for ${ipsToTest.length} IPs...`);
+    
+    for (let i = 0; i < ipsToTest.length; i += BATCH_SIZE) {
+      const batch = ipsToTest.slice(i, i + BATCH_SIZE);
+      const batchPromises = batch.map(ip => testIPSpeed(ip));
+      
+      const batchResults = await Promise.allSettled(batchPromises);
+      
+      for (let j = 0; j < batchResults.length; j++) {
+        const result = batchResults[j];
+        const ip = batch[j];
+        
+        if (result.status === 'fulfilled') {
+          const speedData = result.value;
+          if (speedData.success && speedData.latency) {
+            speedResults.push({
+              ip: ip,
+              latency: Math.round(speedData.latency) // 确保延迟是整数
+            });
+          }
+        }
+      }
+      
+      // 批次间延迟
+      if (i + BATCH_SIZE < ipsToTest.length) {
+        await new Promise(resolve => setTimeout(resolve, 500));
+      }
+    }
+    
+    // 按延迟排序，取前FAST_IP_COUNT个
+    speedResults.sort((a, b) => a.latency - b.latency);
+    const fastIPs = speedResults.slice(0, FAST_IP_COUNT);
+    
+    // 存储优质IP
+    await env.IP_STORAGE.put('cloudflare_fast_ips', JSON.stringify({
+      fastIPs: fastIPs,
+      lastTested: new Date().toISOString(),
+      count: fastIPs.length
+    }));
+    
+    console.log(`Auto speed test completed. Found ${fastIPs.length} fast IPs.`);
+  }
+  
+  // 测试单个IP的速度
+  async function testIPSpeed(ip) {
+    try {
+      const startTime = Date.now();
+      const testUrl = `https://speed.cloudflare.com/__down?bytes=1000`;
+      
+      const response = await fetch(testUrl, {
+        headers: {
+          'Host': 'speed.cloudflare.com'
+        },
+        cf: {
+          resolveOverride: ip
+        }
+      });
+      
+      if (!response.ok) {
+        throw new Error(`HTTP ${response.status}: ${response.statusText}`);
+      }
+      
+      await response.text();
+      const endTime = Date.now();
+      const latency = endTime - startTime;
+      
+      return {
+        success: true,
+        ip: ip,
+        latency: latency
+      };
+      
+    } catch (error) {
+      return {
+        success: false,
+        ip: ip,
+        error: error.message
+      };
     }
   }
   
@@ -1104,9 +1331,8 @@ export default {
     return jsonResponse(data);
   }
   
-  // 主要的IP收集逻辑 - 移除了指定的网站
+  // 主要的IP收集逻辑
   async function updateAllIPs(env) {
-    // 更新后的URL列表 - 移除了指定的网站
     const urls = [
       'https://ip.164746.xyz', 
       'https://ip.haogege.xyz/',
@@ -1114,9 +1340,6 @@ export default {
       'https://api.uouin.com/cloudflare.html',
       'https://addressesapi.090227.xyz/CloudFlareYes',
       'https://addressesapi.090227.xyz/ip.164746.xyz',
-      // 移除了以下两个网站
-      // 'https://www.wetest.vip/page/edgeone/address_v4.html',
-      // 'https://www.wetest.vip/page/cloudfront/address_v4.html',
       'https://www.wetest.vip/page/cloudflare/address_v4.html'
     ];
 
@@ -1247,6 +1470,25 @@ export default {
     return getDefaultData();
   }
   
+  // 从 KV 获取存储的测速IPs
+  async function getStoredSpeedIPs(env) {
+    try {
+      if (!env.IP_STORAGE) {
+        console.error('KV namespace IP_STORAGE is not bound');
+        return getDefaultSpeedData();
+      }
+      
+      const data = await env.IP_STORAGE.get('cloudflare_fast_ips');
+      if (data) {
+        return JSON.parse(data);
+      }
+    } catch (error) {
+      console.error('Error reading speed IPs from KV:', error);
+    }
+    
+    return getDefaultSpeedData();
+  }
+  
   // 默认数据
   function getDefaultData() {
     return {
@@ -1254,6 +1496,15 @@ export default {
       lastUpdated: null,
       count: 0,
       sources: []
+    };
+  }
+  
+  // 默认测速数据
+  function getDefaultSpeedData() {
+    return {
+      fastIPs: [],
+      lastTested: null,
+      count: 0
     };
   }
   
